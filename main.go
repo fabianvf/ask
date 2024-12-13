@@ -21,14 +21,15 @@ import (
 )
 
 const (
-	historyDirName = ".ask/sessions"
-	configFileName = ".ask/config.json"
+	historyDirName     = ".ask/sessions"
+	configFileName     = ".ask/config.json"
+	pendingContextFile = ".ask/pending_context.txt"
 )
 
 var (
 	apiKey    = ""
 	editor    = os.Getenv("EDITOR")
-	model     = "gpt-4"
+	model     = "gpt-4o"
 	debugMode bool
 )
 
@@ -39,7 +40,6 @@ type Config struct {
 func main() {
 	loadAPIKey()
 
-	// Define subcommands
 	refineCmd := flag.NewFlagSet("refine", flag.ExitOnError)
 	interactiveCmd := flag.NewFlagSet("interactive", flag.ExitOnError)
 	contextCmd := flag.NewFlagSet("context", flag.ExitOnError)
@@ -57,7 +57,7 @@ If prompt is omitted, an editor is opened. You can add context before sending.
 Subcommands:
   refine       Refine the last session's response with additional context.
   interactive  Enter an interactive mode.
-  context      Add shell command output as context to the last session.
+  context      Add shell command output as context to the last or future session.
   config       Manage configuration (store API key).
 
 Options:
@@ -246,6 +246,13 @@ func handleAsk(filePath string, run bool) {
 		prompt = runInitialContextLoop(prompt)
 	}
 
+	// Also include any pending context (if exists) to the initial ask
+	pending := loadPendingContext()
+	if pending != "" {
+		prompt += "\n\nAdditional Context:\n" + pending
+		clearPendingContext()
+	}
+
 	if prompt == "" {
 		fmt.Fprintln(os.Stderr, "No prompt provided.")
 		os.Exit(1)
@@ -280,6 +287,42 @@ func handleAsk(filePath string, run bool) {
 	} else {
 		fmt.Fprintf(os.Stderr, "Session stored in: %s\n", sessionPath)
 	}
+}
+
+func loadPendingContext() string {
+	homedir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(homedir, pendingContextFile)
+	data, err := ioutil.ReadFile(path)
+	if err == nil && len(data) > 0 {
+		return string(data)
+	}
+	return ""
+}
+
+func clearPendingContext() {
+	homedir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(homedir, pendingContextFile)
+	os.Remove(path)
+}
+
+func appendToPendingContext(cmdStr, output string) {
+	homedir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(homedir, pendingContextFile)
+	f, ferr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if ferr != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString("\n---\nCommand: " + cmdStr + "\n" + output + "\n")
 }
 
 func runInitialContextLoop(initialPrompt string) string {
@@ -468,6 +511,11 @@ func handleInteractive(args []string) {
 			if debugMode {
 				fmt.Fprintf(os.Stderr, "[DEBUG] Asking prompt:\n%s\n", currentPrompt)
 			}
+			// If we have pending context (in memory), append it now
+			if pendingContext.Len() > 0 {
+				currentPrompt += "\n\nAdditional Context:\n" + pendingContext.String()
+				pendingContext.Reset()
+			}
 			ans, err := askChatGPT(currentPrompt)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -481,14 +529,6 @@ func handleInteractive(args []string) {
 			currentSessionPath = sessionPath
 			fmt.Println("Answer:\n", currentAnswer)
 			fmt.Fprintf(os.Stderr, "Session stored at: %s\n", sessionPath)
-
-			// If we had pending context before the session was created, now write it
-			if pendingContext.Len() > 0 {
-				contextPath := filepath.Join(currentSessionPath, "context.txt")
-				ioutil.WriteFile(contextPath, []byte(pendingContext.String()), 0644)
-				pendingContext.Reset()
-				fmt.Fprintln(os.Stderr, "Pending context added to context.txt")
-			}
 		case line == "refine":
 			if currentAnswer == "" {
 				fmt.Println("No answer to refine. Use 'ask' first.")
@@ -554,21 +594,13 @@ func handleInteractive(args []string) {
 				continue
 			}
 			if currentSessionPath == "" {
-				// Create a session now if not created yet
 				sessionPath, _ := storeSession(currentPrompt, currentAnswer, originalPrompt)
 				currentSessionPath = sessionPath
-				// If pending context, write it now
-				if pendingContext.Len() > 0 {
-					contextPath := filepath.Join(currentSessionPath, "context.txt")
-					ioutil.WriteFile(contextPath, []byte(pendingContext.String()), 0644)
-					pendingContext.Reset()
-				}
 			}
 			if err := runCommandInteractively(cmdStr, currentSessionPath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error running command: %v\n", err)
 			}
 		case line == "context":
-			// Prompt for a command line
 			fmt.Println("Enter a command to run for additional context:")
 			ctxLine, err := rl.Readline()
 			if err != nil && err == io.EOF {
@@ -580,12 +612,9 @@ func handleInteractive(args []string) {
 			}
 			addContextInInteractive(ctxLine, currentSessionPath, &pendingContext)
 		default:
-			// Check if line starts with context <cmd>
 			if strings.HasPrefix(line, "context ") {
 				cmdStr := strings.TrimPrefix(line, "context ")
 				addContextInInteractive(cmdStr, currentSessionPath, &pendingContext)
-			} else if strings.HasPrefix(line, "prompt ") {
-				// already handled above
 			} else if line == "show" {
 				fmt.Println("Current Prompt:\n", currentPrompt)
 				fmt.Println("Current Answer:\n", currentAnswer)
@@ -605,7 +634,6 @@ func addContextInInteractive(cmdStr string, currentSessionPath string, pendingCo
 	}
 	fmt.Println(output)
 
-	// If we have a session, append to context.txt
 	if currentSessionPath != "" {
 		contextPath := filepath.Join(currentSessionPath, "context.txt")
 		f, ferr := os.OpenFile(contextPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -616,7 +644,6 @@ func addContextInInteractive(cmdStr string, currentSessionPath string, pendingCo
 		defer f.Close()
 		f.WriteString("\n---\nCommand: " + cmdStr + "\n" + output + "\n")
 	} else {
-		// No session yet, store in pendingContext
 		pendingContext.WriteString("\n---\nCommand: " + cmdStr + "\n" + output + "\n")
 	}
 }
@@ -639,6 +666,12 @@ func doAsk(prompt, filePath string, run bool) {
 		}
 		prompt = edited
 		prompt = runInitialContextLoop(prompt)
+	}
+
+	pending := loadPendingContext()
+	if pending != "" {
+		prompt += "\n\nAdditional Context:\n" + pending
+		clearPendingContext()
 	}
 
 	if prompt == "" {
@@ -686,8 +719,16 @@ func handleContext(args []string) {
 
 	_, _, sessionPath, err := getLastSession()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "No previous session found. Run `ask` first.\n")
-		os.Exit(1)
+		// No session yet, store in pending context
+		output, cmdErr := runShellCommand(cmdStr)
+		if cmdErr != nil {
+			fmt.Fprintf(os.Stderr, "Error adding context: %v\n", cmdErr)
+			fmt.Fprintln(os.Stderr, output)
+			os.Exit(1)
+		}
+		appendToPendingContext(cmdStr, output)
+		fmt.Println("Context added for future use (pending):", cmdStr)
+		return
 	}
 
 	if err := addContextCommand(cmdStr, sessionPath); err != nil {
@@ -704,12 +745,9 @@ func askChatGPT(prompt string) (string, error) {
 	client := openai.NewClient(apiKey)
 	ctx := context.Background()
 
-	// Add a system message to guide the assistant's behavior
+	// Add a system message to encourage providing instructions rather than complaining
 	systemMessage := "You are a helpful assistant. The user might ask about commands or actions as if you could run them, but you cannot. " +
-		"Do not refuse by stating inability to execute commands. Instead, respond by providing instructions, " +
-		"examples, or guidance as if the user is going to run the command themselves in their environment. " +
-		"No actual execution is expected. If a command or code snippet is requested, just provide it as an example " +
-		"without disclaimers about your inability to run it."
+		"Do not refuse by stating inability to execute commands. Instead, provide instructions, examples, or guidance as if the user will run them themselves."
 
 	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: model,
