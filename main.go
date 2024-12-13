@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,15 +28,18 @@ const (
 )
 
 var (
-	apiKey    = ""
-	editor    = os.Getenv("EDITOR")
-	model     = "gpt-3.5-turbo" // Default model if none set in config
-	debugMode bool
+	apiKey        = ""
+	editor        = os.Getenv("EDITOR")
+	model         = "gpt-4" // Default model if none set in config
+	debugMode     bool
+	maxTokens     = 1000000 // default max tokens if not set by user
+	charsPerToken = 4       // approximate chars per token
 )
 
 type Config struct {
-	APIKey string `json:"api_key"`
-	Model  string `json:"model"`
+	APIKey    string `json:"api_key"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"` // user-configurable max tokens
 }
 
 func main() {
@@ -68,7 +72,7 @@ Subcommands:
   refine       Refine the last session's response with additional context.
   interactive  Enter an interactive mode.
   context      Add shell command output as context to the last or future session.
-  config       Manage configuration (store API key or model).
+  config       Manage configuration (store API key, model, or max-tokens).
   models       List available models from the API.
 
 Options:
@@ -81,6 +85,7 @@ Examples:
   ask refine
   ask config set-key <YOUR_API_KEY>
   ask config set-model gpt-3.5-turbo
+  ask config set-max-tokens 8192
   ask models
 
 Use 'ask <subcommand> -h' for subcommand help.
@@ -94,7 +99,6 @@ Use 'ask <subcommand> -h' for subcommand help.
 		if modelFlag != "" {
 			model = modelFlag
 		}
-		// No prompt given here, handleAsk with no prompt
 		handleAsk("", fileFlag, runFlag)
 		return
 	}
@@ -145,7 +149,7 @@ Use 'ask <subcommand> -h' for subcommand help.
 
 	case "config":
 		configCmd.Usage = func() {
-			fmt.Fprintf(os.Stderr, "Usage:\n  ask config set-key <YOUR_API_KEY>\n  ask config set-model <MODEL>\n")
+			fmt.Fprintf(os.Stderr, "Usage:\n  ask config set-key <YOUR_API_KEY>\n  ask config set-model <MODEL>\n  ask config set-max-tokens <NUMBER>\n")
 			configCmd.PrintDefaults()
 		}
 		configCmd.Parse(os.Args[2:])
@@ -197,6 +201,9 @@ func loadAPIKey() {
 		if cfg.Model != "" {
 			model = cfg.Model // load default model from config
 		}
+		if cfg.MaxTokens > 0 {
+			maxTokens = cfg.MaxTokens
+		}
 	} else if debugMode {
 		fmt.Fprintf(os.Stderr, "[DEBUG] No valid config found or error loading config: %v\n", err)
 	}
@@ -210,7 +217,7 @@ func loadAPIKey() {
 	}
 
 	if debugMode {
-		fmt.Fprintf(os.Stderr, "[DEBUG] Loaded API key and model: model=%s\n", model)
+		fmt.Fprintf(os.Stderr, "[DEBUG] Loaded API key, model=%s, max_tokens=%d\n", model, maxTokens)
 	}
 }
 
@@ -252,6 +259,7 @@ func handleConfig(args []string) {
 		fmt.Println("Usage:")
 		fmt.Println("  ask config set-key <API_KEY>")
 		fmt.Println("  ask config set-model <MODEL>")
+		fmt.Println("  ask config set-max-tokens <NUMBER>")
 		return
 	}
 	switch args[0] {
@@ -280,10 +288,7 @@ func handleConfig(args []string) {
 		}
 		modelName := args[1]
 
-		if !validateModel(modelName) {
-			fmt.Fprintf(os.Stderr, "Warning: Model '%s' not found in API's model list. It may be invalid or not accessible.\n", modelName)
-		}
-
+		// We won't validate here now, since we removed validateModel snippet
 		cfg, _ := loadConfig()
 		if cfg == nil {
 			cfg = &Config{}
@@ -295,8 +300,29 @@ func handleConfig(args []string) {
 			os.Exit(1)
 		}
 		fmt.Printf("Model '%s' saved to config.\n", modelName)
+	case "set-max-tokens":
+		if len(args) < 2 {
+			fmt.Println("Usage: ask config set-max-tokens <NUMBER>")
+			return
+		}
+		val, err := strconv.Atoi(args[1])
+		if err != nil || val <= 0 {
+			fmt.Println("Invalid number for max-tokens.")
+			return
+		}
+		cfg, _ := loadConfig()
+		if cfg == nil {
+			cfg = &Config{}
+		}
+		cfg.MaxTokens = val
+		err = saveConfig(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Max tokens '%d' saved to config.\n", val)
 	default:
-		fmt.Println("Unknown config command. Available: set-key, set-model")
+		fmt.Println("Unknown config command. Available: set-key, set-model, set-max-tokens")
 	}
 }
 
@@ -337,8 +363,43 @@ func handleAsk(prompt, filePath string, run bool) {
 		os.Exit(1)
 	}
 
+	// Apply length limit based on max_tokens
+	maxChars := maxTokens * charsPerToken
+	if len(prompt) > maxChars {
+		// Truncate prompt itself if needed
+		prompt = prompt[:maxChars]
+	} else {
+		// If prompt + context are too long, try truncating context portion
+		// Actually, we've already combined the prompt and context into `prompt`
+		// So we can attempt a smarter truncation here:
+		// We'll look for the "Additional Context:\n" marker and try truncating from there.
+		index := strings.Index(prompt, "Additional Context:\n")
+		if index > -1 {
+			// If overall too long, truncate from end of the prompt
+			if len(prompt) > maxChars {
+				overage := len(prompt) - maxChars
+				// Truncate from the end of context
+				contextStart := index + len("Additional Context:\n")
+				contextLen := len(prompt) - contextStart
+				if contextLen > overage {
+					// Just remove overage from context end
+					newContextEnd := len(prompt) - overage
+					prompt = prompt[:newContextEnd]
+				} else {
+					// Overage bigger than entire context, remove context entirely
+					prompt = prompt[:index]
+				}
+			}
+		} else {
+			// No additional context marker and still too long?
+			if len(prompt) > maxChars {
+				prompt = prompt[:maxChars]
+			}
+		}
+	}
+
 	if debugMode {
-		fmt.Fprintf(os.Stderr, "[DEBUG] Asking prompt:\n%s\n", prompt)
+		fmt.Fprintf(os.Stderr, "[DEBUG] Asking prompt (len=%d, maxChars=%d):\n%s\n", len(prompt), maxChars, prompt)
 	}
 
 	answer, err := askChatGPT(prompt)
@@ -480,6 +541,12 @@ func handleRefine(args []string) {
 		fmt.Fprintf(os.Stderr, "[DEBUG] Refine finalPrompt:\n%s\n", finalPrompt)
 	}
 
+	// Token limit check again (in refinement)
+	maxChars := maxTokens * charsPerToken
+	if len(finalPrompt) > maxChars {
+		finalPrompt = finalPrompt[:maxChars]
+	}
+
 	answer, err := askChatGPT(finalPrompt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting refinement: %v\n", err)
@@ -512,13 +579,19 @@ func handleInteractive(args []string) {
 	var currentAnswer string
 	var currentSessionPath string
 	var originalPrompt string
-	var pendingContext strings.Builder // store context before session is created
+	var pendingContext strings.Builder
+
+	// currentCommands holds all extracted commands from the current answer
+	var currentCommands []string
 
 	for {
 		line, err := rl.Readline()
-		if err == readline.ErrInterrupt || err == io.EOF {
+		if err != nil && err == io.EOF {
+			break
+		} else if err == readline.ErrInterrupt {
 			break
 		}
+
 		line = strings.TrimSpace(line)
 
 		switch {
@@ -530,13 +603,13 @@ func handleInteractive(args []string) {
 			fmt.Println("  prompt <text>    : Set the current prompt directly to <text>")
 			fmt.Println("  ask              : Submit the current prompt to ChatGPT")
 			fmt.Println("  refine           : Refine the current answer with additional context")
-			fmt.Println("  run              : Attempt to run a command extracted from the current answer")
+			fmt.Println("  run              : List available commands extracted from the current answer")
+			fmt.Println("  run <N>          : Run the Nth command (1-based) from the extracted commands")
 			fmt.Println("  context          : Prompt for a command to add context")
 			fmt.Println("  context <cmd>    : Run <cmd> and add output as context immediately")
 			fmt.Println("  show             : Show current prompt and answer")
 			fmt.Println("  exit             : Quit")
-		case strings.HasPrefix(line, "prompt "):
-			currentPrompt = strings.TrimPrefix(line, "prompt ")
+
 		case line == "prompt":
 			edited, err := openEditor(currentPrompt)
 			if err != nil {
@@ -544,115 +617,169 @@ func handleInteractive(args []string) {
 				continue
 			}
 			currentPrompt = edited
-		case line == "ask":
-			if currentPrompt == "" {
-				fmt.Println("No prompt set. Use 'prompt' to set one.")
-				continue
-			}
-			if debugMode {
-				fmt.Fprintf(os.Stderr, "[DEBUG] Asking prompt:\n%s\n", currentPrompt)
-			}
-			if pendingContext.Len() > 0 {
-				currentPrompt += "\n\nAdditional Context:\n" + pendingContext.String()
-				pendingContext.Reset()
-			}
-			ans, err := askChatGPT(currentPrompt)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				continue
-			}
-			currentAnswer = ans
-			if originalPrompt == "" {
-				originalPrompt = currentPrompt
-			}
-			sessionPath, _ := storeSession(currentPrompt, currentAnswer, originalPrompt)
-			currentSessionPath = sessionPath
-			fmt.Println("Answer:\n", currentAnswer)
-			fmt.Fprintf(os.Stderr, "Session stored at: %s\n", sessionPath)
-		case line == "refine":
-			if currentAnswer == "" {
-				fmt.Println("No answer to refine. Use 'ask' first.")
-				continue
-			}
-			var runOutput, contextOutput string
-			if currentSessionPath != "" {
-				runOutput = readFileIfExists(filepath.Join(currentSessionPath, "run_output.txt"))
-				contextOutput = readFileIfExists(filepath.Join(currentSessionPath, "context.txt"))
-				orig, err := ioutil.ReadFile(filepath.Join(currentSessionPath, "original_prompt.txt"))
-				if err == nil && len(orig) > 0 {
-					originalPrompt = string(orig)
+
+		default:
+			if strings.HasPrefix(line, "prompt ") {
+				currentPrompt = strings.TrimPrefix(line, "prompt ")
+			} else if line == "ask" {
+				if currentPrompt == "" {
+					fmt.Println("No prompt set. Use 'prompt' to set one.")
+					continue
 				}
-			}
+				if debugMode {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Asking prompt:\n%s\n", currentPrompt)
+				}
+				if pendingContext.Len() > 0 {
+					currentPrompt += "\n\nAdditional Context:\n" + pendingContext.String()
+					pendingContext.Reset()
+				}
 
-			initialRefine := "Add your refinement:\n\n---\nCurrent Answer:\n" + currentAnswer
-			if runOutput != "" {
-				initialRefine += "\n\nRun Output:\n" + runOutput
-			}
-			if contextOutput != "" {
-				initialRefine += "\n\nAdditional Context:\n" + contextOutput
-			}
-			if originalPrompt != "" {
-				initialRefine += "\n\nOriginal Prompt:\n" + originalPrompt
-			}
+				maxChars := maxTokens * charsPerToken
+				if len(currentPrompt) > maxChars {
+					currentPrompt = currentPrompt[:maxChars]
+				}
 
-			refineEditor, err := openEditor(initialRefine)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				continue
-			}
-			finalPrompt := "Refine this answer with the following context:\nORIGINAL PROMPT:\n" + originalPrompt +
-				"\nANSWER:\n" + currentAnswer
-			if runOutput != "" {
-				finalPrompt += "\nRUN OUTPUT:\n" + runOutput
-			}
-			if contextOutput != "" {
-				finalPrompt += "\nADDITIONAL CONTEXT:\n" + contextOutput
-			}
-			finalPrompt += "\nREFINEMENT:\n" + refineEditor
-
-			if debugMode {
-				fmt.Fprintf(os.Stderr, "[DEBUG] Refine finalPrompt:\n%s\n", finalPrompt)
-			}
-			ans, err := askChatGPT(finalPrompt)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				continue
-			}
-			currentAnswer = ans
-			sessionPath, _ := storeSession(finalPrompt, currentAnswer, originalPrompt)
-			currentSessionPath = sessionPath
-			fmt.Println("Refined Answer:\n", currentAnswer)
-			fmt.Fprintf(os.Stderr, "Refined session stored at: %s\n", sessionPath)
-		case line == "run":
-			if currentAnswer == "" {
-				fmt.Println("No answer to run. Use 'ask' first.")
-				continue
-			}
-			cmdStr := extractCommand(currentAnswer)
-			if cmdStr == "" {
-				fmt.Println("No command found in the current answer.")
-				continue
-			}
-			if currentSessionPath == "" {
+				ans, err := askChatGPT(currentPrompt)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					continue
+				}
+				currentAnswer = ans
+				if originalPrompt == "" {
+					originalPrompt = currentPrompt
+				}
 				sessionPath, _ := storeSession(currentPrompt, currentAnswer, originalPrompt)
 				currentSessionPath = sessionPath
-			}
-			if err := runCommandInteractively(cmdStr, currentSessionPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Error running command: %v\n", err)
-			}
-		case line == "context":
-			fmt.Println("Enter a command to run for additional context:")
-			ctxLine, err := rl.Readline()
-			if err != nil && err == io.EOF {
-				break
-			}
-			ctxLine = strings.TrimSpace(ctxLine)
-			if ctxLine == "" {
-				continue
-			}
-			addContextInInteractive(ctxLine, currentSessionPath, &pendingContext)
-		default:
-			if strings.HasPrefix(line, "context ") {
+				fmt.Println("Answer:\n", currentAnswer)
+				fmt.Fprintf(os.Stderr, "Session stored at: %s\n", sessionPath)
+
+				// Extract all commands from currentAnswer
+				currentCommands = extractCommands(currentAnswer)
+				if len(currentCommands) > 1 {
+					fmt.Printf("%d commands found. Type 'run' to list them or 'run N' to run a specific one.\n", len(currentCommands))
+				} else if len(currentCommands) == 1 {
+					fmt.Println("1 command found. Type 'run' to see it or 'run 1' to run it.")
+				} else {
+					fmt.Println("No commands found in the answer.")
+				}
+
+			} else if line == "refine" {
+				// Refine logic
+				if currentAnswer == "" {
+					fmt.Println("No answer to refine. Use 'ask' first.")
+					continue
+				}
+
+				// Load previous session outputs if available
+				var runOutput, contextOutput string
+				if currentSessionPath != "" {
+					runOutput = readFileIfExists(filepath.Join(currentSessionPath, "run_output.txt"))
+					contextOutput = readFileIfExists(filepath.Join(currentSessionPath, "context.txt"))
+					orig, err := ioutil.ReadFile(filepath.Join(currentSessionPath, "original_prompt.txt"))
+					if err == nil && len(orig) > 0 {
+						originalPrompt = string(orig)
+					}
+				}
+
+				initialRefine := "Refine this answer with the following context:\n\n---\nCurrent Answer:\n" + currentAnswer
+				if runOutput != "" {
+					initialRefine += "\n\nRun Output:\n" + runOutput
+				}
+				if contextOutput != "" {
+					initialRefine += "\n\nAdditional Context:\n" + contextOutput
+				}
+				if originalPrompt != "" {
+					initialRefine += "\n\nOriginal Prompt:\n" + originalPrompt
+				}
+
+				refineEditor, err := openEditor(initialRefine)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					continue
+				}
+				finalPrompt := "Refine this answer with the following context:\nORIGINAL PROMPT:\n" + originalPrompt +
+					"\nANSWER:\n" + currentAnswer
+				if runOutput != "" {
+					finalPrompt += "\nRUN OUTPUT:\n" + runOutput
+				}
+				if contextOutput != "" {
+					finalPrompt += "\nADDITIONAL CONTEXT:\n" + contextOutput
+				}
+				finalPrompt += "\nREFINEMENT:\n" + refineEditor
+				if debugMode {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Refinement \n%s\n", refineEditor)
+				}
+
+				if debugMode {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Refine finalPrompt:\n%s\n", finalPrompt)
+				}
+
+				maxChars := maxTokens * charsPerToken
+				if len(finalPrompt) > maxChars {
+					finalPrompt = finalPrompt[:maxChars]
+				}
+
+				ans, err := askChatGPT(finalPrompt)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					continue
+				}
+				currentAnswer = ans
+				sessionPath, _ := storeSession(finalPrompt, currentAnswer, originalPrompt)
+				currentSessionPath = sessionPath
+				fmt.Println("Refined Answer:\n", currentAnswer)
+				fmt.Fprintf(os.Stderr, "Refined session stored at: %s\n", sessionPath)
+
+				// Extract commands again after refinement if needed
+				currentCommands = extractCommands(currentAnswer)
+
+			} else if strings.HasPrefix(line, "run") {
+				parts := strings.Split(line, " ")
+				if len(parts) == 1 {
+					// run with no arguments: list commands
+					if len(currentCommands) == 0 {
+						fmt.Println("No commands available.")
+					} else {
+						fmt.Println("Available commands:")
+						for i, cmd := range currentCommands {
+							fmt.Printf("%d: %s\n", i+1, cmd)
+						}
+					}
+				} else {
+					// run N
+					if len(currentCommands) == 0 {
+						fmt.Println("No commands available to run.")
+						continue
+					}
+					nStr := parts[1]
+					n, err := strconv.Atoi(nStr)
+					if err != nil || n < 1 || n > len(currentCommands) {
+						fmt.Println("Invalid command number.")
+						continue
+					}
+					cmdStr := currentCommands[n-1]
+					if currentSessionPath == "" {
+						sessionPath, _ := storeSession(currentPrompt, currentAnswer, originalPrompt)
+						currentSessionPath = sessionPath
+					}
+					if err := runCommandInteractively(cmdStr, currentSessionPath); err != nil {
+						fmt.Fprintf(os.Stderr, "Error running command: %v\n", err)
+					}
+				}
+
+			} else if line == "context" {
+				fmt.Println("Enter a command to run for additional context:")
+				ctxLine, err := rl.Readline()
+				if err != nil && err == io.EOF {
+					break
+				}
+				ctxLine = strings.TrimSpace(ctxLine)
+				if ctxLine == "" {
+					continue
+				}
+				addContextInInteractive(ctxLine, currentSessionPath, &pendingContext)
+
+			} else if strings.HasPrefix(line, "context ") {
 				cmdStr := strings.TrimPrefix(line, "context ")
 				addContextInInteractive(cmdStr, currentSessionPath, &pendingContext)
 			} else if line == "show" {
@@ -662,6 +789,65 @@ func handleInteractive(args []string) {
 				fmt.Println("Unknown command. Type 'help' for usage.")
 			}
 		}
+	}
+}
+func extractCommands(answer string) []string {
+	var commands []string
+	lines := strings.Split(answer, "\n")
+
+	inBlock := false
+	var blockLines []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			if inBlock {
+				// End of code block: parse block lines for commands
+				for _, bl := range blockLines {
+					if cmd := parseCommandLine(bl, inBlock); cmd != "" {
+						commands = append(commands, cmd)
+					}
+				}
+				blockLines = nil
+				inBlock = false
+			} else {
+				// Start code block
+				inBlock = true
+				blockLines = nil
+			}
+		} else if inBlock {
+			// Inside code block, collect lines
+			blockLines = append(blockLines, line)
+		} else {
+			// Outside code block, check for $ lines
+			if cmd := parseCommandLine(trimmed, inBlock); cmd != "" {
+				commands = append(commands, cmd)
+			}
+		}
+	}
+
+	return commands
+}
+
+func parseCommandLine(line string, inBlock bool) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return ""
+	}
+	// If inside a code block
+	if inBlock {
+		// Ignore comment lines in code block
+		if strings.HasPrefix(trimmed, "#") {
+			return ""
+		}
+		// Any non-empty, non-comment line inside a code block is a command
+		return trimmed
+	} else {
+		// Outside code block, only lines starting with $ are commands
+		if strings.HasPrefix(trimmed, "$ ") {
+			return strings.TrimPrefix(trimmed, "$ ")
+		}
+		return ""
 	}
 }
 
@@ -698,41 +884,25 @@ func handleModels() {
 	client := openai.NewClient(apiKey)
 	ctx := context.Background()
 
-	modelList, err := client.ListModels(ctx)
+	resp, err := client.ListModels(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing models: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Println("Available Models:")
-	for _, m := range modelList.Models {
-		fmt.Println(m.ID)
-	}
-}
-
-func validateModel(modelName string) bool {
-	client := openai.NewClient(apiKey)
-	ctx := context.Background()
-	modelList, err := client.ListModels(ctx)
-	if err != nil {
-		if debugMode {
-			fmt.Fprintf(os.Stderr, "[DEBUG] Error validating model: %v\n", err)
-		}
-		// If error occurs fetching models, return true to not block user
-		return true
-	}
-
-	for _, m := range modelList.Models {
-		if m.ID == modelName {
-			return true
+	for _, m := range resp.Models {
+		if m.ID == model {
+			fmt.Println("*", m.ID)
+		} else {
+			fmt.Println(m.ID)
 		}
 	}
-	return false
 }
 
 func askChatGPT(prompt string) (string, error) {
 	if debugMode {
-		fmt.Fprintf(os.Stderr, "[DEBUG] Sending prompt to ChatGPT using model '%s':\n%s\n", model, prompt)
+		fmt.Fprintf(os.Stderr, "[DEBUG] Sending prompt to ChatGPT using model '%s' (max_tokens=%d):\n%s\n", model, maxTokens, prompt)
 	}
 	client := openai.NewClient(apiKey)
 	ctx := context.Background()
