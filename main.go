@@ -704,9 +704,17 @@ func askChatGPT(prompt string) (string, error) {
 	client := openai.NewClient(apiKey)
 	ctx := context.Background()
 
+	// Add a system message to guide the assistant's behavior
+	systemMessage := "You are a helpful assistant. The user might ask about commands or actions as if you could run them, but you cannot. " +
+		"Do not refuse by stating inability to execute commands. Instead, respond by providing instructions, " +
+		"examples, or guidance as if the user is going to run the command themselves in their environment. " +
+		"No actual execution is expected. If a command or code snippet is requested, just provide it as an example " +
+		"without disclaimers about your inability to run it."
+
 	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: model,
 		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleSystem, Content: systemMessage},
 			{Role: openai.ChatMessageRoleUser, Content: prompt},
 		},
 	})
