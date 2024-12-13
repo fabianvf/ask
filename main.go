@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,38 +16,68 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chzyer/readline"
 	"github.com/sashabaranov/go-openai"
 )
 
 const (
 	historyDirName = ".ask/sessions"
+	configFileName = ".ask/config.json"
 )
 
 var (
-	apiKey    = os.Getenv("OPENAI_API_KEY")
+	apiKey    = ""
 	editor    = os.Getenv("EDITOR")
 	model     = "gpt-4"
 	debugMode bool
 )
 
-func main() {
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: OPENAI_API_KEY is not set.")
-		os.Exit(1)
-	}
+type Config struct {
+	APIKey string `json:"api_key"`
+}
 
+func main() {
+	loadAPIKey()
+
+	// Define subcommands
 	refineCmd := flag.NewFlagSet("refine", flag.ExitOnError)
 	interactiveCmd := flag.NewFlagSet("interactive", flag.ExitOnError)
 	contextCmd := flag.NewFlagSet("context", flag.ExitOnError)
+	configCmd := flag.NewFlagSet("config", flag.ExitOnError)
 
 	// Global flags
 	var fileFlag string
 	var runFlag bool
 	var debugFlag bool
 
-	// We'll parse flags differently depending on subcommands
+	// Custom usage for the main command
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: ask [options] [prompt]
+
+If prompt is omitted, an editor is opened to provide one. Supports adding context before sending the prompt.
+
+Subcommands:
+  refine       Refine the last session's response with additional context.
+  interactive  Enter an interactive mode to prompt, refine, run commands, and add context.
+  context      Add shell command output as context to the last session.
+  config       Manage configuration (e.g., store API key).
+
+Options:
+`)
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, `
+Examples:
+  ask "How to list all files?"
+  ask -run "Generate a command to list files"
+  ask refine
+  ask config set-key <YOUR_API_KEY>
+
+Use 'ask <subcommand> -h' to see options for a subcommand.
+`)
+	}
+
+	// If no arguments, just parse global flags and handle ask
 	if len(os.Args) < 2 {
-		// no subcommand
 		flag.StringVar(&fileFlag, "f", "", "file path containing prompt")
 		flag.BoolVar(&runFlag, "run", false, "immediately run the resulting command if feasible")
 		flag.BoolVar(&debugFlag, "debug", false, "enable debug output")
@@ -55,36 +87,155 @@ func main() {
 		return
 	}
 
+	// Check if user asked for help at the top-level
+	if os.Args[1] == "-h" || os.Args[1] == "--help" {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	// Switch based on subcommands
 	switch os.Args[1] {
 	case "refine":
 		refineCmd.BoolVar(&debugFlag, "debug", false, "enable debug output")
+		refineCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage: ask refine [options] [refinement text]\n")
+			refineCmd.PrintDefaults()
+		}
 		refineCmd.Parse(os.Args[2:])
 		debugMode = debugFlag
 		handleRefine(refineCmd.Args())
 	case "interactive":
 		interactiveCmd.BoolVar(&debugFlag, "debug", false, "enable debug output")
+		interactiveCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage: ask interactive [options]\n")
+			interactiveCmd.PrintDefaults()
+		}
 		interactiveCmd.Parse(os.Args[2:])
 		debugMode = debugFlag
 		handleInteractive(interactiveCmd.Args())
 	case "context":
 		contextCmd.BoolVar(&debugFlag, "debug", false, "enable debug output")
+		contextCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage: ask context [options] <command>\n")
+			contextCmd.PrintDefaults()
+		}
 		contextCmd.Parse(os.Args[2:])
 		debugMode = debugFlag
 		handleContext(contextCmd.Args())
+	case "config":
+		configCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage: ask config set-key <YOUR_API_KEY>\n")
+			configCmd.PrintDefaults()
+		}
+		configCmd.Parse(os.Args[2:])
+		// No debug flag needed here (but we could add it if desired)
+		handleConfig(configCmd.Args())
 	default:
+		// Global flags after main command
 		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 		flag.CommandLine.StringVar(&fileFlag, "f", "", "file path containing prompt")
 		flag.CommandLine.BoolVar(&runFlag, "run", false, "immediately run the resulting command if feasible")
 		flag.CommandLine.BoolVar(&debugFlag, "debug", false, "enable debug output")
+		flag.CommandLine.Usage = flag.Usage
 		flag.CommandLine.Parse(os.Args[1:])
-		debugMode = debugFlag
 
+		debugMode = debugFlag
 		args := flag.CommandLine.Args()
 		var prompt string
 		if len(args) > 0 {
 			prompt = strings.Join(args, " ")
 		}
 		doAsk(prompt, fileFlag, runFlag)
+	}
+}
+
+func loadAPIKey() {
+	apiKey = os.Getenv("OPENAI_API_KEY")
+	if apiKey != "" {
+		if debugMode {
+			fmt.Fprintln(os.Stderr, "[DEBUG] Using API key from environment variable")
+		}
+		return
+	}
+	// Try to load from config file
+	cfg, err := loadConfig()
+	if err != nil {
+		if debugMode {
+			fmt.Fprintf(os.Stderr, "[DEBUG] No config file found or error loading config: %v\n", err)
+		}
+	} else {
+		if cfg.APIKey != "" {
+			decoded, derr := base64.StdEncoding.DecodeString(cfg.APIKey)
+			if derr == nil {
+				apiKey = string(decoded)
+				if debugMode {
+					fmt.Fprintln(os.Stderr, "[DEBUG] Using API key from config file")
+				}
+			}
+		}
+	}
+
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "No API key found. Please set OPENAI_API_KEY or run `ask config set-key <YOUR_API_KEY>`.")
+		os.Exit(1)
+	}
+}
+
+func loadConfig() (*Config, error) {
+	homedir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	cfgPath := filepath.Join(homedir, configFileName)
+	data, err := ioutil.ReadFile(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	err = json.Unmarshal(data, &cfg)
+	return &cfg, err
+}
+
+func saveConfig(cfg *Config) error {
+	homedir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	cfgDir := filepath.Join(homedir, ".ask")
+	err = os.MkdirAll(cfgDir, 0755)
+	if err != nil {
+		return err
+	}
+	cfgPath := filepath.Join(cfgDir, "config.json")
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(cfgPath, data, 0600)
+}
+
+func handleConfig(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: ask config set-key <API_KEY>")
+		return
+	}
+	switch args[0] {
+	case "set-key":
+		if len(args) < 2 {
+			fmt.Println("Usage: ask config set-key <API_KEY>")
+			return
+		}
+		key := args[1]
+		enc := base64.StdEncoding.EncodeToString([]byte(key))
+		cfg := &Config{APIKey: enc}
+		err := saveConfig(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("API Key saved to config.")
+	default:
+		fmt.Println("Unknown config command. Available: set-key")
 	}
 }
 
@@ -106,6 +257,7 @@ func handleAsk(filePath string, run bool) {
 			os.Exit(1)
 		}
 		prompt = edited
+		prompt = runInitialContextLoop(prompt)
 	}
 
 	if prompt == "" {
@@ -123,7 +275,7 @@ func handleAsk(filePath string, run bool) {
 		os.Exit(1)
 	}
 
-	sessionPath, err := storeSession(prompt, answer, prompt) // original prompt = prompt
+	sessionPath, err := storeSession(prompt, answer, prompt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: Could not store session: %v\n", err)
 	}
@@ -144,6 +296,66 @@ func handleAsk(filePath string, run bool) {
 	}
 }
 
+func runInitialContextLoop(initialPrompt string) string {
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:      "(context mode) > ",
+		HistoryFile: filepath.Join(os.TempDir(), "ask_temp_history.txt"),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing line editor: %v\n", err)
+		return initialPrompt
+	}
+	defer rl.Close()
+
+	fmt.Println("You may now add context or edit the prompt before finalizing.")
+	fmt.Println("Commands:")
+	fmt.Println(":context <cmd> - Run a shell command and add its output as context")
+	fmt.Println(":edit          - Re-edit the prompt")
+	fmt.Println(":done          - Finalize and send the prompt to ChatGPT")
+	fmt.Println("(Use up/down arrows to cycle through history)")
+
+	var extraContext strings.Builder
+	prompt := initialPrompt
+
+	for {
+		line, err := rl.Readline()
+		if err == readline.ErrInterrupt || err == io.EOF {
+			return prompt
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if line == ":done" {
+			if extraContext.Len() > 0 {
+				prompt += "\n\nAdditional Context:\n" + extraContext.String()
+			}
+			return prompt
+		} else if strings.HasPrefix(line, ":context ") {
+			cmdStr := strings.TrimPrefix(line, ":context ")
+			if debugMode {
+				fmt.Fprintf(os.Stderr, "[DEBUG] Running context command: %s\n", cmdStr)
+			}
+			output, cerr := runShellCommand(cmdStr)
+			if cerr != nil {
+				fmt.Fprintf(os.Stderr, "Error adding context: %v\n", cerr)
+			} else {
+				fmt.Println(output)
+				extraContext.WriteString("\n---\nCommand: " + cmdStr + "\n" + output + "\n")
+			}
+		} else if line == ":edit" {
+			edited, err := openEditor(prompt)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to open editor: %v\n", err)
+			} else {
+				prompt = edited
+			}
+		} else {
+			fmt.Println("Unknown command. Available: :context <cmd>, :edit, :done")
+		}
+	}
+}
+
 func handleRefine(args []string) {
 	lastPrompt, lastResponse, lastSessionPath, err := getLastSession()
 	if err != nil {
@@ -151,9 +363,8 @@ func handleRefine(args []string) {
 		os.Exit(1)
 	}
 
-	originalPrompt, err := ioutil.ReadFile(filepath.Join(lastSessionPath, "original_prompt.txt"))
-	if err != nil {
-		// If not found, fallback to lastPrompt as original (shouldn't happen if properly stored)
+	originalPrompt, _ := ioutil.ReadFile(filepath.Join(lastSessionPath, "original_prompt.txt"))
+	if len(originalPrompt) == 0 {
 		originalPrompt = []byte(lastPrompt)
 	}
 
@@ -213,6 +424,16 @@ func handleRefine(args []string) {
 }
 
 func handleInteractive(args []string) {
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:      "> ",
+		HistoryFile: filepath.Join(os.TempDir(), "ask_interactive_history.txt"),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing line editor: %v\n", err)
+		return
+	}
+	defer rl.Close()
+
 	fmt.Println("Entering interactive mode. Type 'help' for commands, 'exit' to quit.")
 	var currentPrompt string
 	var currentAnswer string
@@ -220,17 +441,16 @@ func handleInteractive(args []string) {
 	var originalPrompt string
 
 	for {
-		fmt.Print("> ")
-		var line string
-		_, err := fmt.Scanln(&line)
-		if err != nil && err == io.EOF {
+		line, err := rl.Readline()
+		if err == readline.ErrInterrupt || err == io.EOF {
 			break
 		}
+		line = strings.TrimSpace(line)
 		switch line {
 		case "exit":
 			return
 		case "help":
-			fmt.Println("Commands:\n- prompt: edit the current prompt\n- ask: submit the current prompt to ChatGPT\n- refine: refine the current answer\n- run: attempt to extract and run a command from the current answer\n- context: run a shell command to add context\n- show: display current prompt/answer\n- exit: quit")
+			fmt.Println("Commands:\n- prompt: edit the current prompt\n- ask: submit the current prompt\n- refine: refine the current answer\n- run: run a command from the answer\n- context: add external command output as context\n- show: show current prompt/answer\n- exit: quit")
 		case "prompt":
 			edited, err := openEditor(currentPrompt)
 			if err != nil {
@@ -252,7 +472,6 @@ func handleInteractive(args []string) {
 				continue
 			}
 			currentAnswer = ans
-			// First ask in interactive sets originalPrompt
 			if originalPrompt == "" {
 				originalPrompt = currentPrompt
 			}
@@ -333,25 +552,27 @@ func handleInteractive(args []string) {
 			}
 		case "context":
 			fmt.Println("Enter a command to run for additional context:")
-			var ctxCmdLine string
-			_, err := fmt.Scanln(&ctxCmdLine)
+			ctxLine, err := rl.Readline()
 			if err != nil && err == io.EOF {
 				break
 			}
+			ctxLine = strings.TrimSpace(ctxLine)
+			if ctxLine == "" {
+				continue
+			}
 			if currentSessionPath == "" {
-				if currentAnswer == "" {
+				if currentAnswer == "" && currentPrompt == "" {
 					fmt.Println("No session found. Use 'ask' first to create a session before adding context.")
 					continue
 				} else {
-					// If there's an answer but no sessionPath, store it now
 					sessionPath, _ := storeSession(currentPrompt, currentAnswer, originalPrompt)
 					currentSessionPath = sessionPath
 				}
 			}
-			if err := addContextCommand(ctxCmdLine, currentSessionPath); err != nil {
+			if err := addContextCommand(ctxLine, currentSessionPath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error adding context: %v\n", err)
 			} else {
-				fmt.Println("Context added from command:", ctxCmdLine)
+				fmt.Println("Context added from command:", ctxLine)
 			}
 		case "show":
 			fmt.Println("Current Prompt:\n", currentPrompt)
@@ -372,13 +593,19 @@ func doAsk(prompt, filePath string, run bool) {
 		prompt = string(data)
 	}
 
-	if prompt == "" {
+	if prompt == "" && filePath == "" {
 		edited, err := openEditor("")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to open editor: %v\n", err)
 			os.Exit(1)
 		}
 		prompt = edited
+		prompt = runInitialContextLoop(prompt)
+	}
+
+	if prompt == "" {
+		fmt.Fprintln(os.Stderr, "No prompt provided.")
+		os.Exit(1)
 	}
 
 	if debugMode {
@@ -391,7 +618,7 @@ func doAsk(prompt, filePath string, run bool) {
 		os.Exit(1)
 	}
 
-	sessionPath, err := storeSession(prompt, answer, prompt) // original prompt = prompt if first time
+	sessionPath, err := storeSession(prompt, answer, prompt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not store session: %v\n", err)
 	}
@@ -524,7 +751,6 @@ func storeSession(prompt, answer, originalPrompt string) (string, error) {
 		return "", err
 	}
 
-	// Store or copy original prompt
 	err = ioutil.WriteFile(filepath.Join(currentSessionPath, "original_prompt.txt"), []byte(originalPrompt), 0644)
 	if err != nil {
 		return "", err
@@ -598,7 +824,6 @@ func extractCodeBlock(lines []string) string {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
 			if inBlock {
-				// End of code block
 				return blockContent.String()
 			}
 			inBlock = true
@@ -632,14 +857,7 @@ func runCommandInteractively(cmdStr, sessionPath string) error {
 		fmt.Fprintf(os.Stderr, "[DEBUG] Running shell command: sh -c \"%s\"\n", cmdStr)
 	}
 
-	cmd := exec.Command("sh", "-c", cmdStr)
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-
-	err := cmd.Run()
-	output := outBuf.String() + errBuf.String()
+	output, err := runShellCommand(cmdStr)
 
 	if output != "" {
 		ioutil.WriteFile(filepath.Join(sessionPath, "run_output.txt"), []byte(output), 0644)
@@ -661,12 +879,7 @@ func addContextCommand(cmdStr, sessionPath string) error {
 	if debugMode {
 		fmt.Fprintf(os.Stderr, "[DEBUG] Running context command: sh -c \"%s\"\n", cmdStr)
 	}
-	cmd := exec.Command("sh", "-c", cmdStr)
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	err := cmd.Run()
-	output := outBuf.String() + errBuf.String()
+	output, err := runShellCommand(cmdStr)
 
 	contextPath := filepath.Join(sessionPath, "context.txt")
 	f, ferr := os.OpenFile(contextPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -692,4 +905,14 @@ func readFileIfExists(path string) string {
 		return string(data)
 	}
 	return ""
+}
+
+func runShellCommand(cmdStr string) (string, error) {
+	cmd := exec.Command("sh", "-c", cmdStr)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	output := outBuf.String() + errBuf.String()
+	return output, err
 }
